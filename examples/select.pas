@@ -16,6 +16,7 @@ procedure ProdA(Arg: Pointer);
 begin
   PasSleep(20);
   chA.Send(1);
+  chA.Close;
   TPasWaitGroup(Arg).Done;
 end;
 
@@ -27,9 +28,9 @@ begin
 end;
 
 var
-  cases: array[0..2] of TPasSelectCase;
+  cases: array[0..1] of TPasSelectCase;
   n, got: LongInt;
-  i, idx: LongInt;
+  idx: LongInt;
 begin
   PasInit;
   chA := TIntChan.Create(0);
@@ -40,8 +41,9 @@ begin
     Pas(@ProdA, wg);
     Pas(@ProdB, wg);
     got := 0;
-    for i := 1 to 2 do
-    begin
+    { a blocking select, like Go's: no default case, parks until a case
+      is ready. Ok=False on a receive case means "channel closed". }
+    repeat
       n := 0;
       cases[0].Kind := pasCaseRecv;
       cases[0].Chan := chA.Raw;
@@ -49,21 +51,17 @@ begin
       cases[1].Kind := pasCaseRecv;
       cases[1].Chan := chB.Raw;
       cases[1].Elem := @n;
-      cases[2].Kind := pasCaseDefault;
-      cases[2].Chan := nil;
-      cases[2].Elem := nil;
-      repeat
-        idx := PasSelect(cases);
-        if idx = 2 then
-          PasYield
-        else
-          Break;
-      until False;
-      WriteLn('select idx=', idx, ' value=', n);
-      Inc(got);
-    end;
+      idx := PasSelect(cases);
+      if cases[idx].Ok then
+      begin
+        PasWriteLn('select idx=%d value=%d', [idx, n]);
+        Inc(got);
+      end
+      else
+        PasWriteLn('select idx=%d closed', [idx]);
+    until not cases[idx].Ok;
     wg.Wait;
-    WriteLn('got ', got, ' values; live=', NumPasrutinas);
+    PasWriteLn('got %d values; live=%d', [got, NumPasrutinas]);
   finally
     wg.Free;
     chA.Free;

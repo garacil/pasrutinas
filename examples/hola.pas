@@ -7,7 +7,9 @@ uses
 
 procedure Saluda(Arg: Pointer);
 begin
-  WriteLn('hello from pasrutina ', PasID);
+  { PasWriteLn: one whole line per call from any pasrutina; the RTL's
+    WriteLn keeps a buffer per OS thread and is not thread safe }
+  PasWriteLn('hello from pasrutina %d', [PasID]);
   TPasWaitGroup(Arg).Done;
 end;
 
@@ -16,7 +18,7 @@ var
   i: Integer;
 begin
   PasInit;
-  WriteLn('main pasrutina ', PasID, ' PASMAXPROCS=', PASMAXPROCS(0));
+  PasWriteLn('main pasrutina %d PASMAXPROCS=%d', [PasID, PASMAXPROCS(0)]);
   wg := TPasWaitGroup.Create;
   try
     wg.Add(8);
@@ -26,5 +28,5 @@ begin
   finally
     wg.Free;
   end;
-  WriteLn('done. live pasrutinas=', NumPasrutinas);
+  PasWriteLn('done. live pasrutinas=%d', [NumPasrutinas]);
 end.

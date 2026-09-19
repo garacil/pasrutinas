@@ -15,7 +15,7 @@ begin
   begin
     P := AddPackage('pasrutinas');
     P.ShortName := 'pasrt';
-    P.Version := '1.0.0';
+    P.Version := '1.1.0';
     P.Author := 'Germán Luis Aracil Boned';
     P.License := 'LGPL with modification';
     P.Email := 'garacil@tucall.com';

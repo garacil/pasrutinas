@@ -10,12 +10,4 @@ units/
 *.dbg
 *~
 *.bak
-golang/src/
-golang/.git/
-golang/.github/
-golang/codereview.cfg
-golang/CONTRIBUTING.md
-golang/go.env
-golang/LICENSE
-golang/PATENTS
-golang/SECURITY.md
+golang/

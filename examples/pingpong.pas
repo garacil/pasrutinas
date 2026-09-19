@@ -25,7 +25,7 @@ begin
   begin
     a^.Ch.Send(i);
     n := a^.Ch.Recv;
-    WriteLn('ping got ', n, '  g=', PasID);
+    PasWriteLn('ping got %d  g=%d', [n, PasID]);
   end;
   a^.Wg.Done;
 end;
@@ -39,7 +39,7 @@ begin
   for i := 1 to 10 do
   begin
     n := a^.Ch.Recv;
-    WriteLn('pong got ', n, '  g=', PasID);
+    PasWriteLn('pong got %d  g=%d', [n, PasID]);
     a^.Ch.Send(n + 100);
   end;
   a^.Wg.Done;
@@ -48,6 +48,7 @@ end;
 var
   ch: TIntChan;
   wg: TPasWaitGroup;
+  { the records outlive the pasrutinas because main waits on wg }
   pingArg, pongArg: TPingArg;
 begin
   PasInit;
@@ -62,7 +63,7 @@ begin
     Pas(@Ping, @pingArg);
     Pas(@Pong, @pongArg);
     wg.Wait;
-    WriteLn('done, pasrutinas=', NumPasrutinas);
+    PasWriteLn('done, pasrutinas=%d', [NumPasrutinas]);
   finally
     wg.Free;
     ch.Free;

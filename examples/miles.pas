@@ -16,21 +16,22 @@ end;
 var
   wg: TPasWaitGroup;
   i: LongInt;
-  t0, t1: QWord;
+  t0: Int64;
 begin
   PasInit;
+  { 8 KiB is enough for a trivial body; anything that formats strings or
+    raises needs the 16 KiB default }
   PasSetStackSize(8 * 1024);
-  WriteLn('spawning ', N, ' pasrutinas; stack=', PasStackSize,
-    ' PASMAXPROCS=', PASMAXPROCS(0));
+  PasWriteLn('spawning %d pasrutinas; stack=%d PASMAXPROCS=%d',
+    [N, PasStackSize, PASMAXPROCS(0)]);
   wg := TPasWaitGroup.Create;
   try
-    t0 := GetTickCount64;
+    t0 := PasNow;
     wg.Add(N);
     for i := 1 to N do
       Pas(@Worker, wg);
     wg.Wait;
-    t1 := GetTickCount64;
-    WriteLn('ok in ', t1 - t0, ' ms; live=', NumPasrutinas);
+    PasWriteLn('ok in %d ms; live=%d', [(PasNow - t0) div 1000000, NumPasrutinas]);
   finally
     wg.Free;
   end;

@@ -4,7 +4,8 @@
     Copyright (c) 2026 Germán Luis Aracil Boned
     Author: Germán Luis Aracil Boned <garacil@tucall.com>
 
-    Go-style channels (hchan): send/recv park the pasrutina, not the OS thread.
+    Go-style channels (chan.go hchan, select.go selectgo): send/recv park
+    the pasrutina, not the OS thread.
 
     See the file COPYING.FPC, included in this distribution,
     for details about the copyright.
@@ -13,12 +14,14 @@
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 
-    Send/Recv park the pasrutina (G) without blocking the OS thread (M).
-    The other side calls PasReady: a user-level event.
-
     TPasRawChan is the real implementation (untyped elements). TPasChan<T>
     is a thin generic wrapper so FPC 3.2 does not hit
     "Global Generic template references static symtable".
+
+    A sudog lives on the stack of the waiting pasrutina (stacks are fixed,
+    so unlike Go no cache is needed). Every dequeue claims the sudog with
+    a CAS on the select's done word (chan.go waitq.dequeue), including
+    Close, so exactly one party ever readies a parked pasrutina.
 
  **********************************************************************}
 
@@ -33,9 +36,13 @@ uses
   SysUtils, pasrutinas;
 
 type
+  TPasWaitQ = record
+    first, last: Pointer;
+  end;
+
   TPasRawChan = class
   private
-    FLock: TRTLCriticalSection;
+    FLock: TPasLock;
     FElemSize: SizeInt;
     FCap: SizeInt;
     FCount: SizeInt;
@@ -43,10 +50,11 @@ type
     FRecvx: SizeInt;
     FBuf: Pointer;
     FClosed: Boolean;
-    FRecvQ: Pointer;
-    FSendQ: Pointer;
-    procedure Enqueue(var Q: Pointer; Node: Pointer);
-    function Dequeue(var Q: Pointer): Pointer;
+    FRecvQ: TPasWaitQ;
+    FSendQ: TPasWaitQ;
+    procedure Enqueue(var Q: TPasWaitQ; Node: Pointer);
+    function Dequeue(var Q: TPasWaitQ): Pointer;
+    procedure Remove(var Q: TPasWaitQ; Node: Pointer);
     function Slot(Index: SizeInt): Pointer; inline;
   public
     constructor Create(AElemSize: SizeInt; ACapacity: SizeInt = 0);
@@ -60,10 +68,11 @@ type
     function Closed: Boolean;
     function Len: SizeInt;
     function Cap: SizeInt;
-    function LockPtr: PRTLCriticalSection;
+    function LockPtr: PPasLock;
+    { select support, FLock held by the caller }
     procedure RemoveWaiter(IsSend: Boolean; Node: Pointer);
-    function TrySendLocked(Src: Pointer; out Wake: TPasrutina): Boolean;
-    function TryRecvLocked(Dst: Pointer; out Wake: TPasrutina): Boolean;
+    function TrySendLocked(Src: Pointer; out Wake: TPasrutina; out Ok: Boolean): Boolean;
+    function TryRecvLocked(Dst: Pointer; out Wake: TPasrutina; out Ok: Boolean): Boolean;
     procedure EnqueueSudog(IsSend: Boolean; Node: Pointer);
   end;
 
@@ -91,12 +100,19 @@ const
   pasCaseDefault = 2;
 
 type
+  { Ok is an output: True when a send or receive completed, False when a
+    receive case was chosen because its channel is closed (Go: v, ok :=
+    <-ch inside select). }
   TPasSelectCase = record
     Kind: LongInt;
     Chan: TPasRawChan;
     Elem: Pointer;
+    Ok: Boolean;
   end;
 
+{ select.go selectgo: returns the index of the chosen case, blocking
+  unless a pasCaseDefault case is present. Raises on send to a closed
+  channel like Go panics. }
 function PasSelect(var Cases: array of TPasSelectCase): LongInt;
 
 implementation
@@ -105,58 +121,106 @@ implementation
 
 type
   PSudog = ^TSudog;
+  { runtime2.go sudog }
   TSudog = record
     g: TPasrutina;
     elem: Pointer;
     next: PSudog;
+    prev: PSudog;
     success: Boolean;
+    isSelect: Boolean;
     selDone: PLongInt;
     selWinner: PLongInt;
     selIndex: LongInt;
   end;
 
-function ClaimSudog(sg: PSudog): Boolean;
-begin
-  if sg^.selDone = nil then
-  begin
-    Result := True;
-    Exit;
-  end;
-  Result := InterlockedCompareExchange(sg^.selDone^, 1, 0) = 0;
-  if Result and (sg^.selWinner <> nil) then
-    sg^.selWinner^ := sg^.selIndex;
-end;
-
-procedure TPasRawChan.Enqueue(var Q: Pointer; Node: Pointer);
+procedure TPasRawChan.Enqueue(var Q: TPasWaitQ; Node: Pointer);
 var
-  n, p: PSudog;
+  n, l: PSudog;
 begin
   n := PSudog(Node);
   n^.next := nil;
-  if Q = nil then
+  n^.prev := nil;
+  l := PSudog(Q.last);
+  if l = nil then
   begin
-    Q := n;
+    Q.first := n;
+    Q.last := n;
     Exit;
   end;
-  p := PSudog(Q);
-  while p^.next <> nil do
-    p := p^.next;
-  p^.next := n;
+  n^.prev := l;
+  l^.next := n;
+  Q.last := n;
 end;
 
-function TPasRawChan.Dequeue(var Q: Pointer): Pointer;
+{ chan.go waitq.dequeue: a sudog that belongs to a select is claimed with
+  a CAS on the select's done word; if another case already won, skip. }
+function TPasRawChan.Dequeue(var Q: TPasWaitQ): Pointer;
 var
-  n: PSudog;
+  sg, y: PSudog;
 begin
-  n := PSudog(Q);
-  if n = nil then
+  while True do
   begin
-    Result := nil;
+    sg := PSudog(Q.first);
+    if sg = nil then
+      Exit(nil);
+    y := sg^.next;
+    if y = nil then
+    begin
+      Q.first := nil;
+      Q.last := nil;
+    end
+    else
+    begin
+      y^.prev := nil;
+      Q.first := y;
+      sg^.next := nil;
+    end;
+    if sg^.isSelect then
+    begin
+      if InterlockedCompareExchange(sg^.selDone^, 1, 0) <> 0 then
+        Continue;
+      sg^.selWinner^ := sg^.selIndex;
+    end;
+    Exit(sg);
+  end;
+end;
+
+{ chan.go waitq.dequeueSudoG }
+procedure TPasRawChan.Remove(var Q: TPasWaitQ; Node: Pointer);
+var
+  sg, x, y: PSudog;
+begin
+  sg := PSudog(Node);
+  x := sg^.prev;
+  y := sg^.next;
+  if x <> nil then
+  begin
+    if y <> nil then
+    begin
+      x^.next := y;
+      y^.prev := x;
+      sg^.next := nil;
+      sg^.prev := nil;
+      Exit;
+    end;
+    x^.next := nil;
+    Q.last := x;
+    sg^.prev := nil;
     Exit;
   end;
-  Q := n^.next;
-  n^.next := nil;
-  Result := n;
+  if y <> nil then
+  begin
+    y^.prev := nil;
+    Q.first := y;
+    sg^.next := nil;
+    Exit;
+  end;
+  if Q.first = sg then
+  begin
+    Q.first := nil;
+    Q.last := nil;
+  end;
 end;
 
 function TPasRawChan.Slot(Index: SizeInt): Pointer;
@@ -177,12 +241,14 @@ begin
   FSendx := 0;
   FRecvx := 0;
   FClosed := False;
-  FRecvQ := nil;
-  FSendQ := nil;
+  FRecvQ.first := nil;
+  FRecvQ.last := nil;
+  FSendQ.first := nil;
+  FSendQ.last := nil;
   FBuf := nil;
   if FCap > 0 then
     FBuf := GetMem(FCap * FElemSize);
-  InitCriticalSection(FLock);
+  FLock.key := 0;
   PasInit;
 end;
 
@@ -190,29 +256,30 @@ destructor TPasRawChan.Destroy;
 begin
   if FBuf <> nil then
     FreeMem(FBuf);
-  DoneCriticalSection(FLock);
   inherited Destroy;
 end;
 
+{ chan.go chansend }
 procedure TPasRawChan.Send(Src: Pointer);
 var
   sg: PSudog;
+  mine: TSudog;
+  wake: TPasrutina;
 begin
-  EnterCriticalSection(FLock);
+  PasLockAcquire(FLock);
   if FClosed then
   begin
-    LeaveCriticalSection(FLock);
+    PasLockRelease(FLock);
     raise Exception.Create('paschan: send on closed channel');
   end;
-  repeat
-    sg := PSudog(Dequeue(FRecvQ));
-  until (sg = nil) or ClaimSudog(sg);
+  sg := PSudog(Dequeue(FRecvQ));
   if sg <> nil then
   begin
     Move(Src^, sg^.elem^, FElemSize);
     sg^.success := True;
-    LeaveCriticalSection(FLock);
-    PasInternalReady(sg^.g);
+    wake := sg^.g;
+    PasLockRelease(FLock);
+    PasInternalReady(wake);
     Exit;
   end;
   if FCount < FCap then
@@ -222,38 +289,46 @@ begin
     if FSendx = FCap then
       FSendx := 0;
     Inc(FCount);
-    LeaveCriticalSection(FLock);
+    PasLockRelease(FLock);
     Exit;
   end;
-  New(sg);
-  FillChar(sg^, SizeOf(TSudog), 0);
-  sg^.g := PasCurrent;
-  sg^.elem := Src;
-  Enqueue(FSendQ, sg);
-  PasInternalParkUnlock(FLock);
-  if not sg^.success then
-  begin
-    Dispose(sg);
+  mine := Default(TSudog);
+  mine.g := PasCurrent;
+  mine.elem := Src;
+  Enqueue(FSendQ, @mine);
+  PasInternalParkUnlockLock(FLock);
+  if not mine.success then
     raise Exception.Create('paschan: send on closed channel');
-  end;
-  Dispose(sg);
 end;
 
+{ chan.go chanrecv }
 function TPasRawChan.RecvOk(Dst: Pointer): Boolean;
 var
   sg: PSudog;
+  mine: TSudog;
+  wake: TPasrutina;
 begin
   Result := True;
-  EnterCriticalSection(FLock);
-  repeat
-    sg := PSudog(Dequeue(FSendQ));
-  until (sg = nil) or ClaimSudog(sg);
+  PasLockAcquire(FLock);
+  sg := PSudog(Dequeue(FSendQ));
   if sg <> nil then
   begin
-    Move(sg^.elem^, Dst^, FElemSize);
+    if FCount > 0 then
+    begin
+      { buffered and full: take the head, refill the tail from the sender }
+      Move(Slot(FRecvx)^, Dst^, FElemSize);
+      Move(sg^.elem^, Slot(FRecvx)^, FElemSize);
+      Inc(FRecvx);
+      if FRecvx = FCap then
+        FRecvx := 0;
+      FSendx := FRecvx;
+    end
+    else
+      Move(sg^.elem^, Dst^, FElemSize);
     sg^.success := True;
-    LeaveCriticalSection(FLock);
-    PasInternalReady(sg^.g);
+    wake := sg^.g;
+    PasLockRelease(FLock);
+    PasInternalReady(wake);
     Exit;
   end;
   if FCount > 0 then
@@ -263,41 +338,24 @@ begin
     if FRecvx = FCap then
       FRecvx := 0;
     Dec(FCount);
-    repeat
-      sg := PSudog(Dequeue(FSendQ));
-    until (sg = nil) or ClaimSudog(sg);
-    if sg <> nil then
-    begin
-      Move(sg^.elem^, Slot(FSendx)^, FElemSize);
-      Inc(FSendx);
-      if FSendx = FCap then
-        FSendx := 0;
-      Inc(FCount);
-      sg^.success := True;
-      LeaveCriticalSection(FLock);
-      PasInternalReady(sg^.g);
-      Exit;
-    end;
-    LeaveCriticalSection(FLock);
+    PasLockRelease(FLock);
     Exit;
   end;
   if FClosed then
   begin
-    LeaveCriticalSection(FLock);
+    PasLockRelease(FLock);
     FillChar(Dst^, FElemSize, 0);
     Result := False;
     Exit;
   end;
-  New(sg);
-  FillChar(sg^, SizeOf(TSudog), 0);
-  sg^.g := PasCurrent;
-  sg^.elem := Dst;
-  Enqueue(FRecvQ, sg);
-  PasInternalParkUnlock(FLock);
-  Result := sg^.success;
+  mine := Default(TSudog);
+  mine.g := PasCurrent;
+  mine.elem := Dst;
+  Enqueue(FRecvQ, @mine);
+  PasInternalParkUnlockLock(FLock);
+  Result := mine.success;
   if not Result then
     FillChar(Dst^, FElemSize, 0);
-  Dispose(sg);
 end;
 
 procedure TPasRawChan.Recv(Dst: Pointer);
@@ -307,92 +365,64 @@ end;
 
 function TPasRawChan.TrySend(Src: Pointer): Boolean;
 var
-  sg: PSudog;
+  wake: TPasrutina;
+  ok: Boolean;
 begin
-  Result := False;
-  EnterCriticalSection(FLock);
-  if FClosed then
-  begin
-    LeaveCriticalSection(FLock);
-    Exit;
-  end;
-  repeat
-    sg := PSudog(Dequeue(FRecvQ));
-  until (sg = nil) or ClaimSudog(sg);
-  if sg <> nil then
-  begin
-    Move(Src^, sg^.elem^, FElemSize);
-    sg^.success := True;
-    LeaveCriticalSection(FLock);
-    PasInternalReady(sg^.g);
-    Result := True;
-    Exit;
-  end;
-  if FCount < FCap then
-  begin
-    Move(Src^, Slot(FSendx)^, FElemSize);
-    Inc(FSendx);
-    if FSendx = FCap then
-      FSendx := 0;
-    Inc(FCount);
-    LeaveCriticalSection(FLock);
-    Result := True;
-    Exit;
-  end;
-  LeaveCriticalSection(FLock);
+  PasLockAcquire(FLock);
+  Result := TrySendLocked(Src, wake, ok);
+  PasLockRelease(FLock);
+  if Result and not ok then
+    raise Exception.Create('paschan: send on closed channel');
+  if wake <> nil then
+    PasInternalReady(wake);
 end;
 
 function TPasRawChan.TryRecv(Dst: Pointer): Boolean;
 var
-  sg: PSudog;
+  wake: TPasrutina;
+  ok: Boolean;
 begin
-  Result := False;
-  EnterCriticalSection(FLock);
-  repeat
-    sg := PSudog(Dequeue(FSendQ));
-  until (sg = nil) or ClaimSudog(sg);
-  if sg <> nil then
-  begin
-    Move(sg^.elem^, Dst^, FElemSize);
-    sg^.success := True;
-    LeaveCriticalSection(FLock);
-    PasInternalReady(sg^.g);
-    Result := True;
-    Exit;
-  end;
-  if FCount > 0 then
-  begin
-    Move(Slot(FRecvx)^, Dst^, FElemSize);
-    Inc(FRecvx);
-    if FRecvx = FCap then
-      FRecvx := 0;
-    Dec(FCount);
-    LeaveCriticalSection(FLock);
-    Result := True;
-    Exit;
-  end;
-  LeaveCriticalSection(FLock);
-  FillChar(Dst^, FElemSize, 0);
+  PasLockAcquire(FLock);
+  Result := TryRecvLocked(Dst, wake, ok);
+  PasLockRelease(FLock);
+  if wake <> nil then
+    PasInternalReady(wake);
+  if Result and not ok then
+    Result := False;
+  if not Result then
+    FillChar(Dst^, FElemSize, 0);
 end;
 
+{ chan.go closechan: release all readers (ok=false) and writers (they
+  raise). Selects are claimed by Dequeue like everywhere else. }
 procedure TPasRawChan.Close;
 var
   sg: PSudog;
+  list: array of TPasrutina;
+  n, i: LongInt;
 begin
-  EnterCriticalSection(FLock);
+  PasLockAcquire(FLock);
   if FClosed then
   begin
-    LeaveCriticalSection(FLock);
+    PasLockRelease(FLock);
     raise Exception.Create('paschan: close of closed channel');
   end;
   FClosed := True;
+  n := 0;
+  list := nil;
+  SetLength(list, 16);
   while True do
   begin
     sg := PSudog(Dequeue(FRecvQ));
     if sg = nil then
       Break;
+    if sg^.elem <> nil then
+      FillChar(sg^.elem^, FElemSize, 0);
     sg^.success := False;
-    PasInternalReady(sg^.g);
+    if n = Length(list) then
+      SetLength(list, n * 2);
+    list[n] := sg^.g;
+    Inc(n);
   end;
   while True do
   begin
@@ -400,9 +430,14 @@ begin
     if sg = nil then
       Break;
     sg^.success := False;
-    PasInternalReady(sg^.g);
+    if n = Length(list) then
+      SetLength(list, n * 2);
+    list[n] := sg^.g;
+    Inc(n);
   end;
-  LeaveCriticalSection(FLock);
+  PasLockRelease(FLock);
+  for i := 0 to n - 1 do
+    PasInternalReady(list[i]);
 end;
 
 function TPasRawChan.Closed: Boolean;
@@ -420,22 +455,26 @@ begin
   Result := FCap;
 end;
 
-function TPasRawChan.LockPtr: PRTLCriticalSection;
+function TPasRawChan.LockPtr: PPasLock;
 begin
   Result := @FLock;
 end;
 
-function TPasRawChan.TrySendLocked(Src: Pointer; out Wake: TPasrutina): Boolean;
+{ Result: the case can complete now. Ok: False means "closed". }
+function TPasRawChan.TrySendLocked(Src: Pointer; out Wake: TPasrutina; out Ok: Boolean): Boolean;
 var
   sg: PSudog;
 begin
   Result := False;
   Wake := nil;
+  Ok := True;
   if FClosed then
+  begin
+    Ok := False;
+    Result := True;
     Exit;
-  repeat
-    sg := PSudog(Dequeue(FRecvQ));
-  until (sg = nil) or ClaimSudog(sg);
+  end;
+  sg := PSudog(Dequeue(FRecvQ));
   if sg <> nil then
   begin
     Move(Src^, sg^.elem^, FElemSize);
@@ -455,18 +494,27 @@ begin
   end;
 end;
 
-function TPasRawChan.TryRecvLocked(Dst: Pointer; out Wake: TPasrutina): Boolean;
+function TPasRawChan.TryRecvLocked(Dst: Pointer; out Wake: TPasrutina; out Ok: Boolean): Boolean;
 var
   sg: PSudog;
 begin
   Result := False;
   Wake := nil;
-  repeat
-    sg := PSudog(Dequeue(FSendQ));
-  until (sg = nil) or ClaimSudog(sg);
+  Ok := True;
+  sg := PSudog(Dequeue(FSendQ));
   if sg <> nil then
   begin
-    Move(sg^.elem^, Dst^, FElemSize);
+    if FCount > 0 then
+    begin
+      Move(Slot(FRecvx)^, Dst^, FElemSize);
+      Move(sg^.elem^, Slot(FRecvx)^, FElemSize);
+      Inc(FRecvx);
+      if FRecvx = FCap then
+        FRecvx := 0;
+      FSendx := FRecvx;
+    end
+    else
+      Move(sg^.elem^, Dst^, FElemSize);
     sg^.success := True;
     Wake := sg^.g;
     Result := True;
@@ -483,7 +531,11 @@ begin
     Exit;
   end;
   if FClosed then
+  begin
     FillChar(Dst^, FElemSize, 0);
+    Ok := False;
+    Result := True;
+  end;
 end;
 
 procedure TPasRawChan.EnqueueSudog(IsSend: Boolean; Node: Pointer);
@@ -495,30 +547,11 @@ begin
 end;
 
 procedure TPasRawChan.RemoveWaiter(IsSend: Boolean; Node: Pointer);
-var
-  q: PPointer;
-  p, prev: PSudog;
 begin
   if IsSend then
-    q := @FSendQ
+    Remove(FSendQ, Node)
   else
-    q := @FRecvQ;
-  prev := nil;
-  p := PSudog(q^);
-  while p <> nil do
-  begin
-    if p = PSudog(Node) then
-    begin
-      if prev = nil then
-        q^ := p^.next
-      else
-        prev^.next := p^.next;
-      p^.next := nil;
-      Exit;
-    end;
-    prev := p;
-    p := p^.next;
-  end;
+    Remove(FRecvQ, Node);
 end;
 
 constructor TPasChan.Create(ACapacity: SizeInt);
@@ -584,44 +617,51 @@ begin
 end;
 
 type
-  TSelectLockArr = array[0..15] of PRTLCriticalSection;
+  TSelectLockArr = array[0..15] of PPasLock;
 
+{ select.go selectgo: lock all channels in address order, poll the cases
+  in a random order, otherwise enqueue one sudog per case and park. The
+  first party to claim a sudog (CAS on done) wins and writes winner. }
 function PasSelect(var Cases: array of TPasSelectCase): LongInt;
 var
   n, i, j, defi, chosen: LongInt;
   order: array[0..15] of LongInt;
   locks: TSelectLockArr;
   nlocks, li: LongInt;
-  sgs: array[0..15] of PSudog;
+  sgs: array[0..15] of TSudog;
+  used: array[0..15] of Boolean;
   done, winner: LongInt;
   tmp: LongInt;
   ch: TPasRawChan;
   seed: Cardinal;
   wake: TPasrutina;
+  ok: Boolean;
 begin
   PasInit;
   n := Length(Cases);
   if n > 16 then
-    n := 16;
+    raise Exception.Create('PasSelect: at most 16 cases');
   locks := Default(TSelectLockArr);
   defi := -1;
   for i := 0 to n - 1 do
   begin
     order[i] := i;
-    sgs[i] := nil;
+    used[i] := False;
+    Cases[i].Ok := False;
     if Cases[i].Kind = pasCaseDefault then
       defi := i;
   end;
-  seed := Cardinal(PasID) xor Cardinal(GetTickCount64);
+  seed := Cardinal(PasID) xor Cardinal(PasNow);
   for i := n - 1 downto 1 do
   begin
     seed := seed * 1103515245 + 12345;
-    j := LongInt(seed mod Cardinal(i + 1));
+    j := LongInt((seed shr 8) mod Cardinal(i + 1));
     tmp := order[i];
     order[i] := order[j];
     order[j] := tmp;
   end;
 
+  { lock order: by address, once per distinct channel }
   nlocks := 0;
   for i := 0 to n - 1 do
   begin
@@ -646,23 +686,27 @@ begin
   end;
 
   for i := 0 to nlocks - 1 do
-    EnterCriticalSection(locks[i]^);
+    PasLockAcquire(locks[i]^);
 
+  { pass 1: look for something already waiting }
   chosen := -1;
   wake := nil;
+  ok := True;
   for i := 0 to n - 1 do
   begin
     j := order[i];
     ch := Cases[j].Chan;
+    if ch = nil then
+      Continue;
     case Cases[j].Kind of
       pasCaseSend:
-        if (ch <> nil) and ch.TrySendLocked(Cases[j].Elem, wake) then
+        if ch.TrySendLocked(Cases[j].Elem, wake, ok) then
         begin
           chosen := j;
           Break;
         end;
       pasCaseRecv:
-        if (ch <> nil) and ch.TryRecvLocked(Cases[j].Elem, wake) then
+        if ch.TryRecvLocked(Cases[j].Elem, wake, ok) then
         begin
           chosen := j;
           Break;
@@ -673,9 +717,12 @@ begin
   if chosen >= 0 then
   begin
     for i := nlocks - 1 downto 0 do
-      LeaveCriticalSection(locks[i]^);
+      PasLockRelease(locks[i]^);
     if wake <> nil then
       PasInternalReady(wake);
+    Cases[chosen].Ok := ok;
+    if (Cases[chosen].Kind = pasCaseSend) and not ok then
+      raise Exception.Create('paschan: send on closed channel');
     Result := chosen;
     Exit;
   end;
@@ -683,18 +730,20 @@ begin
   if defi >= 0 then
   begin
     for i := nlocks - 1 downto 0 do
-      LeaveCriticalSection(locks[i]^);
+      PasLockRelease(locks[i]^);
     Result := defi;
     Exit;
   end;
 
   if nlocks = 0 then
   begin
+    { a select with no channel cases blocks forever }
     PasPark;
     Result := -1;
     Exit;
   end;
 
+  { pass 2: enqueue on all channels and park }
   done := 0;
   winner := -1;
   for i := 0 to n - 1 do
@@ -702,35 +751,39 @@ begin
     ch := Cases[i].Chan;
     if (ch = nil) or (Cases[i].Kind = pasCaseDefault) then
       Continue;
-    New(sgs[i]);
-    FillChar(sgs[i]^, SizeOf(TSudog), 0);
-    sgs[i]^.g := PasCurrent;
-    sgs[i]^.elem := Cases[i].Elem;
-    sgs[i]^.selDone := @done;
-    sgs[i]^.selWinner := @winner;
-    sgs[i]^.selIndex := i;
-    ch.EnqueueSudog(Cases[i].Kind = pasCaseSend, sgs[i]);
+    sgs[i] := Default(TSudog);
+    sgs[i].g := PasCurrent;
+    sgs[i].elem := Cases[i].Elem;
+    sgs[i].isSelect := True;
+    sgs[i].selDone := @done;
+    sgs[i].selWinner := @winner;
+    sgs[i].selIndex := i;
+    used[i] := True;
+    ch.EnqueueSudog(Cases[i].Kind = pasCaseSend, @sgs[i]);
   end;
 
-  FillChar(locks[nlocks], SizeOf(PRTLCriticalSection) * (16 - nlocks), 0);
   PasInternalParkUnlockMany(locks);
 
+  { pass 3: dequeue the losers under all locks, read the winner }
   for i := 0 to nlocks - 1 do
-    EnterCriticalSection(locks[i]^);
+    PasLockAcquire(locks[i]^);
   for i := 0 to n - 1 do
   begin
-    if sgs[i] = nil then
+    if not used[i] then
+      Continue;
+    if i = winner then
       Continue;
     ch := Cases[i].Chan;
-    if Cases[i].Kind = pasCaseSend then
-      ch.RemoveWaiter(True, sgs[i])
-    else
-      ch.RemoveWaiter(False, sgs[i]);
-    Dispose(sgs[i]);
+    ch.RemoveWaiter(Cases[i].Kind = pasCaseSend, @sgs[i]);
   end;
   for i := nlocks - 1 downto 0 do
-    LeaveCriticalSection(locks[i]^);
+    PasLockRelease(locks[i]^);
 
+  if winner < 0 then
+    raise Exception.Create('paschan: select woke without a winner');
+  Cases[winner].Ok := sgs[winner].success;
+  if (Cases[winner].Kind = pasCaseSend) and not sgs[winner].success then
+    raise Exception.Create('paschan: send on closed channel');
   Result := winner;
 end;
 

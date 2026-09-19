@@ -35,7 +35,7 @@ begin
     for i := 1 to 8 do
       Pas(@Worker, wg);
     wg.Wait;
-    WriteLn('counter=', n, ' (expected 8000)');
+    PasWriteLn('counter=%d (expected 8000)', [n]);
   finally
     wg.Free;
     mu.Free;

@@ -9,8 +9,12 @@ UNITDIR  := ./units
 WARN     := -vwnh -Sewnh -vm11030,11031
 FLAGS    := $(CPUFLAGS) $(MODE) $(INCLUDES) -FE$(OUTDIR) -FU$(UNITDIR) -gl $(WARN)
 
+SRCS     := src/pasrutinas.pas src/paschan.pas
+
 EXAMPLES := hola pingpong miles sleep select poll mutex once
-TESTS    := test_spawn test_chan test_bufchan test_select test_sleep test_mutex test_once
+TESTS    := test_spawn test_chan test_bufchan test_select test_sleep test_mutex \
+            test_once test_mn test_exceptions test_sigstack test_timers \
+            test_netpoll test_selclose test_writeln test_stress test_syscall
 
 .PHONY: all examples tests check clean
 
@@ -22,56 +26,28 @@ $(OUTDIR) $(UNITDIR):
 examples: $(OUTDIR) $(UNITDIR) $(addprefix $(OUTDIR)/,$(EXAMPLES))
 tests: $(OUTDIR) $(UNITDIR) $(addprefix $(OUTDIR)/,$(TESTS))
 
-$(OUTDIR)/hola: examples/hola.pas src/pasrutinas.pas
-	$(FPC) $(FLAGS) examples/hola.pas
+$(OUTDIR)/%: examples/%.pas $(SRCS) | $(OUTDIR) $(UNITDIR)
+	$(FPC) $(FLAGS) $<
 
-$(OUTDIR)/pingpong: examples/pingpong.pas src/pasrutinas.pas src/paschan.pas
-	$(FPC) $(FLAGS) examples/pingpong.pas
+$(OUTDIR)/%: tests/%.pas $(SRCS) | $(OUTDIR) $(UNITDIR)
+	$(FPC) $(FLAGS) $<
 
-$(OUTDIR)/miles: examples/miles.pas src/pasrutinas.pas
-	$(FPC) $(FLAGS) examples/miles.pas
-
-$(OUTDIR)/sleep: examples/sleep.pas src/pasrutinas.pas
-	$(FPC) $(FLAGS) examples/sleep.pas
-
-$(OUTDIR)/select: examples/select.pas src/pasrutinas.pas src/paschan.pas
-	$(FPC) $(FLAGS) examples/select.pas
-
-$(OUTDIR)/poll: examples/poll.pas src/pasrutinas.pas
-	$(FPC) $(FLAGS) examples/poll.pas
-
-$(OUTDIR)/mutex: examples/mutex.pas src/pasrutinas.pas
-	$(FPC) $(FLAGS) examples/mutex.pas
-
-$(OUTDIR)/once: examples/once.pas src/pasrutinas.pas
-	$(FPC) $(FLAGS) examples/once.pas
-
-$(OUTDIR)/test_spawn: tests/test_spawn.pas src/pasrutinas.pas
-	$(FPC) $(FLAGS) tests/test_spawn.pas
-
-$(OUTDIR)/test_chan: tests/test_chan.pas src/pasrutinas.pas src/paschan.pas
-	$(FPC) $(FLAGS) tests/test_chan.pas
-
-$(OUTDIR)/test_bufchan: tests/test_bufchan.pas src/pasrutinas.pas src/paschan.pas
-	$(FPC) $(FLAGS) tests/test_bufchan.pas
-
-$(OUTDIR)/test_select: tests/test_select.pas src/pasrutinas.pas src/paschan.pas
-	$(FPC) $(FLAGS) tests/test_select.pas
-
-$(OUTDIR)/test_sleep: tests/test_sleep.pas src/pasrutinas.pas
-	$(FPC) $(FLAGS) tests/test_sleep.pas
-
-$(OUTDIR)/test_mutex: tests/test_mutex.pas src/pasrutinas.pas
-	$(FPC) $(FLAGS) tests/test_mutex.pas
-
-$(OUTDIR)/test_once: tests/test_once.pas src/pasrutinas.pas
-	$(FPC) $(FLAGS) tests/test_once.pas
-
-check: tests
+# Every test exits non-zero on failure. test_writeln is checked from
+# outside: 16000 lines of 120 characters must come out whole through a
+# pipe. Examples are run once as well.
+check: all
 	@set -e; \
 	for t in $(TESTS); do \
 	  echo "==== $$t ===="; \
-	  timeout 20 $(OUTDIR)/$$t; \
+	  if [ $$t = test_writeln ]; then \
+	    timeout 60 $(OUTDIR)/$$t | awk 'length($$0)!=120{bad++} END{print "lines="NR" corrupted="bad+0; exit (bad+0)>0 || NR!=16000}'; \
+	  else \
+	    timeout 120 $(OUTDIR)/$$t; \
+	  fi; \
+	done; \
+	for e in $(EXAMPLES); do \
+	  echo "==== example $$e ===="; \
+	  timeout 60 $(OUTDIR)/$$e > /dev/null; \
 	done; \
 	echo ALL_TESTS_OK
 

@@ -11,7 +11,7 @@ var
 
 procedure InitOnce;
 begin
-  WriteLn('init once from pasrutina ', PasID);
+  PasWriteLn('init once from pasrutina %d', [PasID]);
 end;
 
 procedure Worker(Arg: Pointer);
@@ -31,7 +31,7 @@ begin
     for i := 1 to 16 do
       Pas(@Worker, wg);
     wg.Wait;
-    WriteLn('done live=', NumPasrutinas);
+    PasWriteLn('done live=%d', [NumPasrutinas]);
   finally
     wg.Free;
     once.Free;
