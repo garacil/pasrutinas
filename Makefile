@@ -4,7 +4,10 @@ MODE     := -Mobjfpc -Scgi -O2
 INCLUDES := -Fu./src
 OUTDIR   := ./bin
 UNITDIR  := ./units
-FLAGS    := $(CPUFLAGS) $(MODE) $(INCLUDES) -FE$(OUTDIR) -FU$(UNITDIR) -gl
+# -Sewnh: treat warnings, notes and hints as errors.
+# -vm11030,11031: hide FPC's own "reading /etc/fpc.cfg" hints.
+WARN     := -vwnh -Sewnh -vm11030,11031
+FLAGS    := $(CPUFLAGS) $(MODE) $(INCLUDES) -FE$(OUTDIR) -FU$(UNITDIR) -gl $(WARN)
 
 EXAMPLES := hola pingpong miles sleep select poll mutex once
 TESTS    := test_spawn test_chan test_bufchan test_select test_sleep test_mutex test_once

@@ -32,9 +32,11 @@ begin
     P.CPUs := [x86_64];
 
     P.SourcePath.Add('src');
-    T := P.Targets.AddUnit('pasrutinas.pas');
+    P.Targets.AddUnit('pasrutinas.pas');
     T := P.Targets.AddUnit('paschan.pas');
     T.Dependencies.AddUnit('pasrutinas');
+    P.Targets.AddExampleProgram('mutex.pas');
+    P.Targets.AddExampleProgram('once.pas');
 
     P.ExamplePath.Add('examples');
     P.Targets.AddExampleProgram('hola.pas');

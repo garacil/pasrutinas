@@ -159,14 +159,14 @@ procedure PasInternalReady(G: TPasrutina);
 
 implementation
 
-uses
-  unixtype;
+{ This unit is x86_64-only (see $ERROR above). Stack arithmetic is
+  pointer/ordinal conversion by definition. }
+{$WARN 4055 OFF}
 
 type
   TPasBuf = packed record
     rbx, rbp, r12, r13, r14, r15, rsp, rip: QWord;
   end;
-  PPasBuf = ^TPasBuf;
 
   TParkKind = (pkNone, pkPark, pkYield, pkExit);
 
@@ -239,7 +239,6 @@ type
   PTimer = ^TTimer;
 
 const
-  Gidle     = 0;
   Grunnable = 1;
   Grunning  = 2;
   Gwaiting  = 3;
@@ -271,7 +270,6 @@ const
   EPOLLRDHUP  = $2000;
   EPOLLET     = LongWord($80000000);
   EPOLL_CTL_ADD = 1;
-  EPOLL_CTL_DEL = 2;
   EPOLL_CLOEXEC = $80000;
   EFD_CLOEXEC   = $80000;
   EFD_NONBLOCK  = $800;
@@ -287,7 +285,6 @@ type
     events: LongWord;
     data: Pointer;
   end;
-  PEpollEvent = ^TEpollEvent;
 
   PPollDesc = ^TPollDesc;
   TPollDesc = record
@@ -360,7 +357,7 @@ procedure NetpollBreak; forward;
 
 procedure InitBuf(out Buf: TPasBuf; SP, PC: Pointer);
 begin
-  FillChar(Buf, SizeOf(Buf), 0);
+  Buf := Default(TPasBuf);
   Buf.rsp := PtrUInt(SP);
   Buf.rip := PtrUInt(PC);
 end;
@@ -563,7 +560,6 @@ begin
   if t - h < PasRunqSize then
   begin
     pp^.runq[t and (PasRunqSize - 1)] := gp;
-    ReadWriteBarrier;
     pp^.runqtail := t + 1;
     Exit;
   end;
@@ -1063,7 +1059,7 @@ begin
     epfd := -1;
     Exit;
   end;
-  FillChar(ev, SizeOf(ev), 0);
+  ev := Default(TEpollEvent);
   ev.events := EPOLLIN;
   ev.data := nil;
   if libc_epoll_ctl(epfd, EPOLL_CTL_ADD, eventFd, @ev) <> 0 then
@@ -1162,7 +1158,7 @@ begin
   fl := libc_fcntl(Fd, F_GETFL, 0);
   if fl >= 0 then
     libc_fcntl(Fd, F_SETFL, fl or O_NONBLOCK);
-  FillChar(ev, SizeOf(ev), 0);
+  ev := Default(TEpollEvent);
   ev.events := EPOLLIN or EPOLLOUT or EPOLLRDHUP or EPOLLET;
   ev.data := Result;
   libc_epoll_ctl(epfd, EPOLL_CTL_ADD, Fd, @ev);
@@ -1397,7 +1393,6 @@ begin
   if InterlockedCompareExchange(initState, 1, 0) = 0 then
   begin
     InitMainM;
-    WriteBarrier;
     InterlockedExchange(initState, 2);
   end
   else
@@ -1573,9 +1568,6 @@ begin
 end;
 
 { TPasWaitGroup }
-
-type
-  PWaitNode = PG;
 
 constructor TPasWaitGroup.Create;
 begin

@@ -101,6 +101,8 @@ function PasSelect(var Cases: array of TPasSelectCase): LongInt;
 
 implementation
 
+{$WARN 4055 OFF}
+
 type
   PSudog = ^TSudog;
   TSudog = record
@@ -581,11 +583,14 @@ begin
   Result := FRaw.Cap;
 end;
 
+type
+  TSelectLockArr = array[0..15] of PRTLCriticalSection;
+
 function PasSelect(var Cases: array of TPasSelectCase): LongInt;
 var
   n, i, j, defi, chosen: LongInt;
   order: array[0..15] of LongInt;
-  locks: array[0..15] of PRTLCriticalSection;
+  locks: TSelectLockArr;
   nlocks, li: LongInt;
   sgs: array[0..15] of PSudog;
   done, winner: LongInt;
@@ -598,7 +603,7 @@ begin
   n := Length(Cases);
   if n > 16 then
     n := 16;
-  FillChar(locks, SizeOf(locks), 0);
+  locks := Default(TSelectLockArr);
   defi := -1;
   for i := 0 to n - 1 do
   begin
