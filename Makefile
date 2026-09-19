@@ -16,7 +16,7 @@ TESTS    := test_spawn test_chan test_bufchan test_select test_sleep test_mutex 
             test_once test_mn test_exceptions test_sigstack test_timers \
             test_netpoll test_selclose test_writeln test_stress test_syscall
 
-.PHONY: all examples tests check clean
+.PHONY: all examples tests check bench clean
 
 all: examples tests
 
@@ -50,6 +50,12 @@ check: all
 	  timeout 60 $(OUTDIR)/$$e > /dev/null; \
 	done; \
 	echo ALL_TESTS_OK
+
+# Side by side with Go: needs a Go toolchain in PATH.
+bench: $(OUTDIR) $(UNITDIR)
+	$(FPC) $(FLAGS) bench/bench.pas
+	cd bench && go build -o ../$(OUTDIR)/bench_go bench.go
+	@for i in 1 2 3; do $(OUTDIR)/bench_go; $(OUTDIR)/bench; done
 
 clean:
 	rm -rf $(OUTDIR) $(UNITDIR)

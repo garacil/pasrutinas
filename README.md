@@ -84,22 +84,29 @@ begin
 end.
 ```
 
-## Performance
+## Benchmark
 
-Same machine (32 CPUs, Linux 7.2), Go 1.27.1 with `GOMAXPROCS=32`
-against pasrutinas with `PASMAXPROCS=32`, best of three runs:
+`bench/bench.pas` and `bench/bench.go` run the same four measurements.
+`make bench` builds both (a Go toolchain must be in `PATH`) and runs
+each three times. Same machine (32 CPUs, Linux 7.2), Go 1.27.1 with
+`GOMAXPROCS=32` against pasrutinas with `PASMAXPROCS=32`, best of three:
 
-| Benchmark | Go | pasrutinas |
+| Measurement | Go | pasrutinas |
 |---|---|---|
-| Spawn 300 000 trivial goroutines / pasrutinas | 44 ms | 45 ms |
-| 200 000 round trips on an unbuffered channel | 43 ms | 42 ms |
-| 8 × 100 000 `Lock`/`Unlock` on one mutex | 31 ms | 22 ms |
-| 20 000 sleepers of 100..199 ms | 209 ms | 300 ms |
+| 300 000 trivial goroutines / pasrutinas spawned and joined | 48 ms | 37 ms |
+| 200 000 round trips on an unbuffered channel | 43 ms | 41 ms |
+| 20 000 sleepers of 100..199 ms spawned at once | 211 ms | 239 ms |
+| 8 × 100 000 `Lock`/`Unlock` on one contended mutex | 26 ms | 24 ms |
 
-Per operation: a park plus reschedule costs about 57 ns, a buffered
-send plus receive 30 ns, a full unbuffered round trip 194 ns on one P.
-The remaining gap on sleepers is thread wake-ups while 20 000 timers are
-armed within a few milliseconds.
+Per operation on one P: a park plus reschedule costs about 57 ns, a
+buffered send plus receive 30 ns, an unbuffered round trip 194 ns.
+
+The sleeper case measures fresh stack allocation: 20 000 pasrutinas
+alive at once need 20 000 new stacks, and the first write to each one
+is a page fault (about 1.3 µs on this kernel) after a 0.4 µs
+`madvise` guard. Go pays the same fault per page but its stacks are
+2 KiB, so two goroutines share one fault. Recycled stacks cost about
+150 ns per spawn, which is what the first row measures.
 
 ## How it works
 
@@ -150,11 +157,15 @@ signal stack, so they can be caught even inside an 8 KiB stack.
 inserts stack growth (`morestack`). Free Pascal cannot. Default stack is
 16 KiB (`PasSetStackSize`); 8 KiB is enough for tiny workers, anything
 that formats strings or raises needs the default. Stacks are
-demand-paged: an idle pasrutina dirties about one page. Each stack is
-one `mmap` plus one guard page, i.e. two kernel VMAs; with the default
-`vm.max_map_count` of 65530 that allows about 32 000 pasrutinas alive at
-once (raise the sysctl for more). Stacks are cached per P and globally,
-and unmapped above 1024 cached.
+demand-paged: an idle pasrutina dirties about one page. Stacks are
+carved from `mmap` slabs of 64; the guard page is installed with
+`madvise(MADV_GUARD_INSTALL)` (Linux 6.13+), which does not split the
+mapping, so the number of live pasrutinas is not bounded by
+`vm.max_map_count`. On older kernels the guard falls back to
+`mprotect`, which costs two map entries per stack (about 32 000 live
+pasrutinas with the default limit of 65530). Freed stacks are cached per
+P and globally; above 1024 cached their pages are released with
+`MADV_DONTNEED` and the mapping is kept for reuse.
 
 **Output.** The RTL’s `WriteLn` keeps a buffer per OS thread and is not
 thread safe. Use `PasWriteLn` from pasrutinas: one whole line per call,

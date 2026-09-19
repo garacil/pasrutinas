@@ -47,8 +47,11 @@ routine in `src/pasrutinas.pas` names the Go function it mirrors.
 `Pas(@F)` (`newproc`):
 
 1. Take a G from the P's free list, else a stack from the slab
-   allocator: one `PROT_NONE` reservation per 32 stacks, each stack
-   enabled with `mprotect` leaving its first page as the guard.
+   allocator: one `mmap` per 64 stacks, the first page of each stack
+   guarded with `madvise(MADV_GUARD_INSTALL)` (no VMA split; `mprotect`
+   on kernels before 6.13). Freed stacks go to the P's cache, then to a
+   global warm list, then to a cold list whose pages are released with
+   `MADV_DONTNEED`.
 2. Point `TPasBuf.rip` at `PasTrampoline`, `rsp` at the top of the
    stack with a zero return address (`gostartcall`).
 3. `runqput(next = true)`: the new G becomes `runnext`, the previous

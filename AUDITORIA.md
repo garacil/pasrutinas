@@ -138,7 +138,7 @@ función de Go que refleja. Cambios visibles para el usuario:
 | C7 | `spinning` por M, `nSpinning`, `needSpinning` | `PASRUTINAS_STATS` |
 | C8 | `ExitProc`: aparca los M y vacía `Output`/`StdErr` de cada hilo | todos (código de salida 0) |
 | C9 | `Dequeue` reclama con CAS, `Close` incluido; `Ok` en el caso elegido | `test_selclose` |
-| M1 | Pilas por slabs (`PROT_NONE` + `mprotect` por pila), caché por P y global, `munmap` por encima de 1024 | `test_stress` |
+| M1 | Pilas por slabs de 64 con guarda `madvise(MADV_GUARD_INSTALL)` (sin partir el VMA; `mprotect` en kernels < 6.13), caché por P, lista caliente global y lista fría con `MADV_DONTNEED` | `test_stress` |
 | M2 | Punteros a `StackBottom`/`StackLength` cacheados por M; `mp` pasado como parámetro; `NowNs` solo con timers | micro-benchmark |
 | M3 | Sudog en la pila de la pasrutina; colas con `first/last`; pollDesc indexado por fd | `test_chan`, `test_select` |
 | M4 | `sysmon` con `retake`; `PasEnterSyscall`/`PasExitSyscall`; bandera `preempt` honrada por `Pas()` | `test_syscall` |
@@ -160,7 +160,7 @@ función de Go que refleja. Cambios visibles para el usuario:
 | Flanco que llega sin nadie esperando | cuelgue | — | recibido |
 | `select` con canal cerrado | `-1` | — | caso 0, `Ok=False` |
 | 300 000 spawns triviales | 1751 ms, 1,3 GB RSS | 235 ms, 129 MB | 45–65 ms, 12 MB |
-| 20 000 dormilones de 100–199 ms | 866 ms | 255 | 289 ms |
+| 20 000 dormilones de 100–199 ms | 866 ms | 255 | 239 ms |
 | 2 000 000 spawns con yield | `EOutOfMemory` | — | 1,7 s |
 | 32 pasrutinas × 500 líneas por tubería | 0 corruptas (1 hilo) | 2767 corruptas | 0 corruptas |
 
@@ -171,25 +171,31 @@ tres ejecuciones (`bench.go` y `bench.pas` equivalentes):
 
 | Benchmark | Go | pasrutinas |
 |---|---|---|
-| 300 000 gorutinas/pasrutinas triviales | 44 ms | 45 ms |
+| 300 000 gorutinas/pasrutinas triviales | 48 ms | 37 ms |
 | 200 000 idas y vueltas por canal sin búfer | 43 ms | 41 ms |
-| 8 × 100 000 `Lock`/`Unlock` | 29 ms | 22 ms |
-| 20 000 dormilones de 100–199 ms | 209 ms | 289 ms |
+| 8 × 100 000 `Lock`/`Unlock` | 26 ms | 24 ms |
+| 20 000 dormilones de 100–199 ms | 211 ms | 239 ms |
 
 Por operación (un P): parada más replanificación 57 ns; envío más
-recepción con búfer 30 ns; ida y vuelta sin búfer 194 ns. La diferencia
-que queda en los dormilones es el coste de la primera asignación de cada
-pila (`mprotect` de la guarda y el fallo de página inicial, unos 4 µs por
-pila nueva; las recicladas cuestan 150 ns). Go no usa páginas de guarda
-porque su compilador comprueba la pila.
+recepción con búfer 30 ns; ida y vuelta sin búfer 194 ns. Los programas
+están en `bench/` (`make bench`). La diferencia que queda en los
+dormilones es el fallo de página inicial de cada pila nueva (1,3 µs en
+este kernel, más 0,4 µs de la guarda con `madvise`): 20 000 pasrutinas
+vivas a la vez necesitan 20 000 pilas nuevas, y Go amortiza ese mismo
+fallo entre dos gorutinas por tener pilas de 2 KiB. Medido: `mprotect`
+por pila costaba 1,9 µs y hacía el primer fallo el doble de caro;
+`MADV_POPULATE_WRITE` no mejora (el coste es poblar la página, no la
+trampa).
 
 ## 6. Límites conocidos
 
 - Sin preempción asíncrona: un bucle sin puntos de planificación retiene
   su P hasta que llama a `Pas()`, aparca o cede (`sysmon` marca la
   pasrutina; `Pas()` cede al verlo).
-- Cada pila ocupa 2 VMA; con `vm.max_map_count = 65530` (valor por defecto
-  de Debian/Ubuntu) caben unas 32 000 pasrutinas vivas a la vez.
+- Con un kernel anterior a 6.13 (sin `MADV_GUARD_INSTALL`) cada pila
+  ocupa 2 VMA; con `vm.max_map_count = 65530` (valor por defecto de
+  Debian/Ubuntu) caben unas 32 000 pasrutinas vivas a la vez. Con 6.13+
+  no hay límite por VMA.
 - Con `{$S+}` (`-Ct`) el RTL usa `StackMargin = 32768` en x86_64
   (`inc/system.inc:54`), mayor que la pila de 16 KiB: cualquier
   procedimiento compilado con comprobación de pila dentro de una

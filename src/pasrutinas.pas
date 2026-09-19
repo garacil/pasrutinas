@@ -394,8 +394,11 @@ const
   sysmonMinUs    = 20;                 { proc.go sysmon: 20us .. 10ms }
   sysmonMaxUs    = 10 * 1000;
   gFreeLocalMax  = 64;                 { proc.go gfput: 64 per P }
-  gFreeGlobalMax = 1024;               { stacks kept before munmap }
-  stackSlabCount = 32;                 { stacks reserved per mmap }
+  gFreeGlobalMax = 1024;               { warm stacks kept resident }
+  stackSlabCount = 64;                 { stacks reserved per mmap }
+  { asm-generic/mman-common.h }
+  MADV_DONTNEED      = 4;
+  MADV_GUARD_INSTALL = 102;            { Linux 6.13+: guard without a VMA split }
 
   { lock_futex.go }
   lockUnlocked  = 0;
@@ -457,6 +460,7 @@ function libc_close(fd: LongInt): LongInt; cdecl; external 'c' name 'close';
 function libc_fcntl(fd, cmd: LongInt; arg: LongInt): LongInt; cdecl; external 'c' name 'fcntl';
 function libc_usleep(usec: LongWord): LongInt; cdecl; external 'c' name 'usleep';
 function libc_sigaltstack(ss, oss: Pointer): LongInt; cdecl; external 'c' name 'sigaltstack';
+function libc_madvise(addr: Pointer; len: PtrUInt; advice: LongInt): LongInt; cdecl; external 'c' name 'madvise';
 
 threadvar
   currentM: PM;
@@ -488,8 +492,11 @@ var
   lastPoll: Int64 = 0;             { atomic: 0 while an M blocks in netpoll }
   pollUntilGlobal: Int64 = 0;      { atomic: sched.pollUntil }
   nextGoid: Int64 = 1;
-  gFreeGlobal: PG = nil;
+  gFreeGlobal: PG = nil;               { warm: pages still resident }
   gFreeGlobalN: LongInt = 0;
+  gFreeCold: PG = nil;                 { cold: MADV_DONTNEED applied }
+  gFreeColdN: LongInt = 0;
+  guardWithMprotect: Boolean = False;  { kernel without MADV_GUARD_INSTALL }
 
   { stack slab: one PROT_NONE reservation, stacks are enabled one by one
     with mprotect (stack.go stackalloc carves spans the same way) }
@@ -827,7 +834,7 @@ begin
   LockAcquire(stackLock);
   if (slabNext = 0) or (slabStride <> total) or (slabNext + total > slabEnd) then
   begin
-    p := Fpmmap(nil, total * stackSlabCount, PROT_NONE,
+    p := Fpmmap(nil, total * stackSlabCount, PROT_READ or PROT_WRITE,
       MAP_PRIVATE or MAP_ANONYMOUS or MAP_NORESERVE, -1, 0);
     if (p = nil) or (p = MAP_FAILED) then
     begin
@@ -842,11 +849,19 @@ begin
   p := Pointer(slabNext);
   Inc(slabNext, total);
   LockRelease(stackLock);
-  { the first page stays PROT_NONE as the guard }
-  if Fpmprotect(Pointer(PtrUInt(p) + guard), total - guard, PROT_READ or PROT_WRITE) <> 0 then
+  { guard page: MADV_GUARD_INSTALL marks the PTEs without splitting the
+    VMA (about 0.4 us); older kernels fall back to mprotect (a VMA per
+    stack, about 2 us and 2 map entries per stack) }
+  if (not guardWithMprotect) and (libc_madvise(p, guard, MADV_GUARD_INSTALL) = 0) then
+    { guarded }
+  else
   begin
-    Result := False;
-    Exit;
+    guardWithMprotect := True;
+    if Fpmprotect(p, guard, PROT_NONE) <> 0 then
+    begin
+      Result := False;
+      Exit;
+    end;
   end;
   Map := p;
   MapLen := total;
@@ -877,6 +892,16 @@ begin
   if (not gp^.isMain) and (gp^.stackMap <> nil) then
     Fpmunmap(gp^.stackMap, gp^.stackMapLen);
   Dispose(gp);
+end;
+
+{ Drop the resident pages of a cached stack, keep the mapping: no VMA
+  churn, the next user pays one page fault. schedLock held. }
+procedure ColdG(gp: PG);
+begin
+  libc_madvise(gp^.stackLo, PtrUInt(gp^.stackHi) - PtrUInt(gp^.stackLo), MADV_DONTNEED);
+  gp^.schedlink := gFreeCold;
+  gFreeCold := gp;
+  Inc(gFreeColdN);
 end;
 
 { proc.go gfput }
@@ -930,7 +955,7 @@ begin
       h := gFreeGlobal;
       gFreeGlobal := h^.schedlink;
       Dec(gFreeGlobalN);
-      FreeG(h);
+      ColdG(h);
     end;
     LockRelease(schedLock);
     Exit;
@@ -944,9 +969,7 @@ begin
     h := gFreeGlobal;
     gFreeGlobal := h^.schedlink;
     Dec(gFreeGlobalN);
-    LockRelease(schedLock);
-    FreeG(h);
-    Exit;
+    ColdG(h);
   end;
   LockRelease(schedLock);
 end;
@@ -957,16 +980,25 @@ var
   i: LongInt;
   h: PG;
 begin
-  if (pp <> nil) and (pp^.gFree = nil) and (gFreeGlobal <> nil) then
+  if (pp <> nil) and (pp^.gFree = nil) and ((gFreeGlobal <> nil) or (gFreeCold <> nil)) then
   begin
     LockAcquire(schedLock);
     for i := 1 to gFreeLocalMax div 2 do
     begin
       h := gFreeGlobal;
-      if h = nil then
-        Break;
-      gFreeGlobal := h^.schedlink;
-      Dec(gFreeGlobalN);
+      if h <> nil then
+      begin
+        gFreeGlobal := h^.schedlink;
+        Dec(gFreeGlobalN);
+      end
+      else
+      begin
+        h := gFreeCold;
+        if h = nil then
+          Break;
+        gFreeCold := h^.schedlink;
+        Dec(gFreeColdN);
+      end;
       h^.schedlink := pp^.gFree;
       pp^.gFree := h;
       Inc(pp^.gFreeN);
