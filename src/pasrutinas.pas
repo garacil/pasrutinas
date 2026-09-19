@@ -592,7 +592,7 @@ begin
   end;
 end;
 
-{ sys_linux_amd64.s runtime·futex: raw syscall, no libc. FPC passes the
+{ sys_linux_amd64.s runtime.futex: raw syscall, no libc. FPC passes the
   first integer parameters in rdi, rsi, rdx on x86_64 Linux (SysV order);
   the kernel wants nr in rax, timeout in r10, uaddr2 in r8, val3 in r9. }
 function FutexCall(Addr: PLongInt; Op: LongInt; Val: LongInt): PtrInt; assembler; nostackframe;
