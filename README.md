@@ -1,7 +1,14 @@
 # pasrutinas
 
-Lightweight user-space threads for [Free Pascal](https://www.freepascal.org/),
-modelled on Go goroutines.
+An important addition to [Free Pascal](https://www.freepascal.org/):
+**user-space lightweight threads**, modelled on Go goroutines.
+
+FPC already ships OS threads (`TThread`, `BeginThread`) and callback
+event loops (`fcl-async`). It has nothing like Go’s goroutines: tens of
+thousands of tiny stacks multiplexed onto a few pthreads, parked on
+channels, timers and I/O without blocking the OS thread. That is the
+gap this package fills. It is offered to the FPC team for inclusion
+under `packages/`.
 
 A *pasrutina* is not an operating-system thread. It is a small control
 block plus a few kilobytes of stack, multiplexed by a user-level
@@ -10,8 +17,13 @@ channel, a timer, a mutex or a file descriptor parks the pasrutina and
 frees the OS thread to run another one.
 
 **Author:** Germán Luis Aracil Boned  
-**License:** BSD-3-Clause  
-**Platform:** Linux x86_64, Free Pascal 3.2.2+
+**License:** LGPL 2.1 with the FPC linking exception (`COPYING.FPC`), same as the RTL and packages  
+**Platform:** Linux x86_64, Free Pascal 3.2.2+  
+**GitHub:** https://github.com/garacil/pasrutinas  
+**GitLab:** https://gitlab.com/garacilb/pasrutinas  
+
+Offered to the Free Pascal team (GitLab group `freepascal.org/fpc`, id 12463123):
+https://gitlab.com/freepascal.org/fpc/source/-/work_items/41919
 
 ## Requirements
 
@@ -30,12 +42,15 @@ uses
 
 ```
 make
+make check
 ./bin/hola
 ./bin/pingpong
 ./bin/miles
 ./bin/sleep
 ./bin/select
 ./bin/poll
+./bin/mutex
+./bin/once
 ```
 
 Add `src/` to the compiler unit path:
@@ -186,6 +201,10 @@ Kinds: `pasCaseSend`, `pasCaseRecv`, `pasCaseDefault`.
 | `examples/sleep.pas` | User-level timers |
 | `examples/select.pas` | `PasSelect` |
 | `examples/poll.pas` | `PasWaitRead` on a pipe |
+| `examples/mutex.pas` | `TPasMutex` |
+| `examples/once.pas` | `TPasOnce` |
+
+`make check` builds and runs the programs under `tests/` (spawn, channels, buffered channel, select, sleep, mutex, once). They exit non-zero on failure.
 
 ## Limits
 
@@ -210,5 +229,10 @@ Channels follow `hchan` / `sudog` in `runtime/chan.go`. I/O follows
 
 ## Copyright
 
-Copyright (c) 2026 Germán Luis Aracil Boned. BSD-3-Clause.
-The Go runtime, used as a reference, is Copyright The Go Authors.
+Copyright (c) 2026 Germán Luis Aracil Boned.
+
+Licensed under the same terms as the Free Pascal RTL and packages:
+GNU LGPL 2.1 with the FPC linking exception. See `COPYING.FPC` and
+`COPYING`. You may link this library into programs under any license.
+
+The Go runtime, used as a design reference, is Copyright The Go Authors.

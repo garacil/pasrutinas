@@ -1,28 +1,40 @@
 {
-  pasrutinas — Go goroutines ported to Free Pascal.
+    This file is part of pasrutinas.
 
-  Copyright (c) 2026 Germán Luis Aracil Boned
-  Author: Germán Luis Aracil Boned <garacil@tucall.com>
-  SPDX-License-Identifier: BSD-3-Clause
+    Copyright (c) 2026 Germán Luis Aracil Boned
+    Author: Germán Luis Aracil Boned <garacil@tucall.com>
 
-  Copied from golang/src/runtime (HACKING.md, runtime2.go, proc.go,
-  asm_amd64.s, stack.go, chan.go):
+    User-space lightweight threads for Free Pascal (Go-style goroutines):
+    an M:N scheduler, channels, select, timers and epoll. Intended as an
+    addition to the Free Pascal packages: FPC already has OS threads and
+    callback event loops; it has no green threads.
 
-    G  = pasrutina   (work item, a few KiB of its own stack)
-    M  = OS thread   (pthread / BeginThread)
-    P  = processor   (local run queue + the right to run Pascal code)
+    See the file COPYING.FPC, included in this distribution,
+    for details about the copyright.
 
-  Switching G does not enter the kernel: a TPasBuf is saved/restored
-  (same layout as FPC jmp_buf: rbx,rbp,r12-r15,rsp,rip) via the RTL
-  symbols FPC_SETJMP / FPC_LONGJMP.
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 
-  Public prefix: Pas / PAS, never Go.
+    Copied from golang/src/runtime (HACKING.md, runtime2.go, proc.go,
+    asm_amd64.s, stack.go, chan.go):
 
-  Usage:
-    uses cthreads, pasrutinas, paschan;
-    Pas(@Proc);
-    PASMAXPROCS(N);
-}
+      G  = pasrutina   (work item, a few KiB of its own stack)
+      M  = OS thread   (pthread / BeginThread)
+      P  = processor   (local run queue + the right to run Pascal code)
+
+    Switching G does not enter the kernel: a TPasBuf is saved/restored
+    (same layout as FPC jmp_buf: rbx,rbp,r12-r15,rsp,rip) via the RTL
+    symbols FPC_SETJMP / FPC_LONGJMP.
+
+    Public prefix: Pas / PAS, never Go.
+
+    Usage:
+      uses cthreads, pasrutinas, paschan;
+      Pas(@Proc);
+      PASMAXPROCS(N);
+
+ **********************************************************************}
 
 {$mode objfpc}{$H+}
 {$asmmode att}

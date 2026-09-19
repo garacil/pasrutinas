@@ -1,17 +1,26 @@
 {
-  paschan — Go-style channels (golang/src/runtime/chan.go, type hchan).
+    This file is part of pasrutinas.
 
-  Copyright (c) 2026 Germán Luis Aracil Boned
-  Author: Germán Luis Aracil Boned <garacil@tucall.com>
-  SPDX-License-Identifier: BSD-3-Clause
+    Copyright (c) 2026 Germán Luis Aracil Boned
+    Author: Germán Luis Aracil Boned <garacil@tucall.com>
 
-  Send/Recv park the pasrutina (G) without blocking the OS thread (M).
-  The other side calls PasReady: a user-level event.
+    Go-style channels (hchan): send/recv park the pasrutina, not the OS thread.
 
-  TPasRawChan is the real implementation (untyped elements). TPasChan<T>
-  is a thin generic wrapper so FPC 3.2 does not hit
-  "Global Generic template references static symtable".
-}
+    See the file COPYING.FPC, included in this distribution,
+    for details about the copyright.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+    Send/Recv park the pasrutina (G) without blocking the OS thread (M).
+    The other side calls PasReady: a user-level event.
+
+    TPasRawChan is the real implementation (untyped elements). TPasChan<T>
+    is a thin generic wrapper so FPC 3.2 does not hit
+    "Global Generic template references static symtable".
+
+ **********************************************************************}
 
 {$mode objfpc}{$H+}
 {$S-}
