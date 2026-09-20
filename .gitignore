@@ -10,4 +10,5 @@ units/
 *.dbg
 *~
 *.bak
+fpmake.bin
 golang/
