@@ -158,14 +158,23 @@ inserts stack growth (`morestack`). Free Pascal cannot. Default stack is
 16 KiB (`PasSetStackSize`); 8 KiB is enough for tiny workers, anything
 that formats strings or raises needs the default. Stacks are
 demand-paged: an idle pasrutina dirties about one page. Stacks are
-carved from `mmap` slabs of 64; the guard page is installed with
+carved from `mmap` slabs of 64; the guard is installed with
 `madvise(MADV_GUARD_INSTALL)` (Linux 6.13+), which does not split the
 mapping, so the number of live pasrutinas is not bounded by
 `vm.max_map_count`. On older kernels the guard falls back to
-`mprotect`, which costs two map entries per stack (about 32 000 live
+`mprotect`, which costs map entries per stack (about 32 000 live
 pasrutinas with the default limit of 65530). Freed stacks are cached per
 P and globally; above 1024 cached their pages are released with
 `MADV_DONTNEED` and the mapping is kept for reuse.
+
+**Overflowing a stack is survivable once.** The guard is two pages. The
+upper one is opened on the first overflow, which buys a page of headroom
+and turns the fault into a catchable `EStackOverflow`, so the
+pasrutina's own `try/except` runs and its cleanup — `Done`, `Free`,
+unlocks — actually happens. An overflow that runs past that rescue says
+which pasrutina it was and how big its stack is, then `_exit(2)`.
+Nothing is silent and nothing spins. `PasStackAvail` returns the margin
+left, for code that would rather look than find out.
 
 **Output.** The RTL’s `WriteLn` keeps a buffer per OS thread and is not
 thread safe. Use `PasWriteLn` from pasrutinas: one whole line per call,

@@ -189,6 +189,13 @@ not the trap).
 
 ## 6. Known limits
 
+- A stack overflow is **survivable once, then fatal**. The guard is two
+  pages: the upper one is opened on the first overflow, which buys a page of
+  headroom and turns the fault into a catchable `EStackOverflow`, so the
+  pasrutina's own `try/except` runs and its cleanup happens. An overflow that
+  continues past that rescue writes a diagnostic naming the pasrutina and its
+  stack size, and calls `_exit(2)`. The page is armed again when the stack is
+  recycled. See §7.
 - No asynchronous preemption: a loop without scheduling points keeps its P
   until it calls `Pas()`, parks or yields (`sysmon` flags the pasrutina;
   `Pas()` yields when it sees the flag).
@@ -203,3 +210,86 @@ not the trap).
   to the millisecond, as Go's `netpoll` does.
 - Pasrutinas still running when the main program ends are abandoned, as
   goroutines are.
+
+## 7. Stack overflow: what it did, and what it does now
+
+Added 2026-09-20. Worth its own section because the old behaviour was not
+what it looked like, and because the fix is not obvious from the code.
+
+### What it did
+
+A pasrutina that overflowed its stack appeared to die in silence: no
+exception, nothing on stderr, and anything waiting on it hung for ever. It
+was worse than that. Measured with a chained observer that only logged:
+
+```
+#1 control, null deref:  cr2=0x0                 -> EAccessViolation, caught
+#2 the overflow:         cr2=rsp=0x7f47eb2c0fd0  -> rsp walks into the guard
+#3 the RTL retries:      cr2=0x7f47eb2c0fc8      -> EIGHT BYTES LOWER,
+                                                    rip=SignalToHandleErrorAddrFrame
+```
+
+`rtl/linux/x86_64/sighnd.inc` does not raise from the handler. It rewrites
+the signal context to resume the RTL's error trampoline **on the stack that
+just ran out**; the trampoline's own push faults a few bytes lower; repeat.
+The process state while "hung": `STAT=R`, **100% of one core, indefinitely**,
+with the other Ms idle. So a single bad pasrutina pinned a core for ever,
+took its M out of the scheduler permanently, hung every waiter, and printed
+nothing.
+
+### What it does now
+
+The guard is two pages instead of one:
+
+```
+  [ red page | yellow page ][ stackLo .............. stackHi ]
+```
+
+`PasSigSegv` looks at `cr2`. Outside `[stackMap, stackLo)` it chains to the
+RTL, so a null dereference still raises a catchable `EAccessViolation`
+exactly as before. Inside the band:
+
+- **yellow, first hit** — open the page (one `mprotect`, or
+  `MADV_GUARD_REMOVE` on 6.13+), then do what the RTL would have done but
+  with error **202** instead of 216: `rdi/rsi/rdx` = (202, rip, rbp) and
+  `rip` = `HandleErrorAddrFrame`. The pasrutina resumes with a page of room
+  and raises `EStackOverflow`, which its `try/except` can catch.
+- **red, or yellow already open** — the rescue itself overflowed. Write the
+  diagnostic with `write(2)` and `_exit(2)`. No heap, no `Format`, no
+  `PasWriteLn`: async-signal-safe.
+
+`RecycleG` re-arms the page, so a recycled stack is never handed on without
+its net.
+
+### Two things worth knowing before touching this
+
+**The handler must preserve `sa_restorer`.** On Linux x86_64 `rt_sigaction`
+requires it, and building the struct from `Default(SigActionRec)` zeroes it:
+the process then dies with a core on **return** from the handler, even for a
+plain null dereference. Read the current action, copy it, replace only the
+handler and OR the flags — which is what `InstallOnStackHandlers` already did
+for `SA_ONSTACK`, for the same reason.
+
+**Recovering is a deliberate choice, not obviously the right one.** Go treats
+stack exhaustion as fatal, and continuing does leave the pasrutina's own
+state questionable. The choice here is for the server case — one pasrutina
+per connection, where losing a connection is acceptable and losing the
+process is not. The red page keeps the fatal path for when recovery has
+already failed once.
+
+### Verified
+
+Tested on Fedora 38, FPC 3.2.2, kernel 6.8.9:
+
+- overflow caught, cleanup runs, `wg.Wait()` returns, exit 0
+- 200 pasrutinas recycle the stack, a later one overflows and is caught too
+- second overflow with the page open: diagnostic on stderr, exit 2
+- no regression: `raise`, division by zero and null dereference all still
+  caught inside a pasrutina
+- `make check` green, 16 tests and 8 examples
+- no measurable cost: over 6 runs each, spawns and mutex land inside the
+  spread of the unmodified code
+
+**Not** verified: the `MADV_GUARD_REMOVE` path. This kernel is 6.8.9, so it
+falls back to `mprotect` and only that branch was exercised. The 6.13+ branch
+is symmetric by inspection and untested by measurement.

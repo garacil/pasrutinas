@@ -24,6 +24,7 @@ the program. Every routine below names the Go function it mirrors.
 | `function PASMAXPROCS(N: LongInt): LongInt` | `runtime.GOMAXPROCS` | `N < 1` queries. Must be set before the first `Pas()`/`PasInit`; raises otherwise |
 | `procedure PasSetStackSize(Bytes: PtrUInt)` | | Stack of pasrutinas created from now on. Default 16 KiB, minimum 4 KiB, rounded to pages |
 | `function PasStackSize: PtrUInt` | | |
+| `function PasStackAvail: PtrUInt` | | Bytes of stack left below the caller, 0 outside a pasrutina. For code about to recurse deeply or put a large buffer on the stack. Overflowing is survivable once (README, *Stacks*), but it costs that pasrutina |
 | `procedure PasInit` | `schedinit` | Called implicitly by everything; explicit call optional |
 
 ### Parking

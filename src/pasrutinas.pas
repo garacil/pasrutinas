@@ -69,7 +69,24 @@ const
     growth, so a pasrutina gets a fixed mmap'ed stack (demand paged: an
     idle pasrutina dirties about one page) plus one PROT_NONE guard page. }
   PasStackDefault = 16 * 1024;
-  PasStackGuard   = 4096;
+  { Two pages, not one, and they are not interchangeable:
+
+      [ red page | yellow page ][ stackLo .......... stackHi ]
+
+    The YELLOW page is the one the stack touches first when it overflows.
+    The handler opens it, which buys the pasrutina a page of headroom, and
+    turns the fault into a catchable EStackOverflow (runtime error 202) so
+    the user's try/except runs and its cleanup happens.
+
+    The RED page below it is never opened. Reaching it means the overflow
+    continued after the rescue, and that is fatal and loud.
+
+    Without this, a stack overflow was NOT a death: measured 2026-09-20, the
+    RTL rewrites the signal context to resume its trampoline ON THE EXHAUSTED
+    STACK, whose own push faults 8 bytes lower, for ever. One core pinned at
+    100%, that M lost to the scheduler, every waiter hung, and not one byte
+    printed. }
+  PasStackGuard   = 8192;
   PasG0StackSize  = 64 * 1024;
   PasRunqSize     = 256;        { proc.go: len(p.runq) }
   PasMStackSize   = 256 * 1024;
@@ -179,6 +196,11 @@ function  PasID: QWord;
 function  NumPasrutinas: LongInt;
 function  PASMAXPROCS(N: LongInt): LongInt;
 procedure PasSetStackSize(Bytes: PtrUInt);
+
+{ Bytes of stack still below the caller. A pasrutina that is about to
+  recurse deeply can check this instead of finding out the hard way.
+  0 outside a pasrutina. }
+function PasStackAvail: PtrUInt;
 function  PasStackSize: PtrUInt;
 procedure PasInit;
 function  PasNow: Int64;              { nanotime: CLOCK_MONOTONIC in ns }
@@ -248,6 +270,9 @@ type
     stackMap: Pointer;
     stackMapLen: PtrUInt;
     stackSize: PtrUInt;
+    { the yellow guard page has been opened for this pasrutina; it is armed
+      again when the stack is recycled, or the next owner inherits no net }
+    yellowOpen: Boolean;
     status: LongInt;              { atomic: Gidle..Gdead }
     preempt: LongInt;             { set by sysmon, honoured at scheduling points }
     goid: QWord;
@@ -399,6 +424,7 @@ const
   { asm-generic/mman-common.h }
   MADV_DONTNEED      = 4;
   MADV_GUARD_INSTALL = 102;            { Linux 6.13+: guard without a VMA split }
+  MADV_GUARD_REMOVE  = 103;            { ... and its undo, to open the yellow page }
 
   { lock_futex.go }
   lockUnlocked  = 0;
@@ -422,6 +448,23 @@ const
   pdNil: Pointer = nil;
   pdReady: Pointer = Pointer(1);
   pdWait: Pointer = Pointer(2);
+
+{ Linux x86_64 sigcontext, laid out as rtl/linux/x86_64/sighndh.inc
+  TSigContext. Declared here rather than including an RTL internal file by
+  path. Only the tail matters to us: rip/rbp to hand to HandleErrorAddrFrame,
+  rdi/rsi/rdx to pass its arguments, and cr2, which on x86 holds the address
+  that faulted. }
+type
+  PPasSigCtx = ^TPasSigCtx;
+  TPasSigCtx = record
+    __pad00: array[0..4] of QWord;
+    r8, r9, r10, r11, r12, r13, r14, r15,
+    rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, eflags: QWord;
+    cs, gs, fs, __pad0: Word;
+    err, trapno, oldmask, cr2: QWord;
+  end;
+
+  TPasSigHandler3 = procedure(sig: LongInt; info: PSigInfo; ctx: PPasSigCtx); cdecl;
 
 { Linux x86_64 epoll_event is packed: 4-byte events + 8-byte data. }
 type
@@ -461,6 +504,16 @@ function libc_fcntl(fd, cmd: LongInt; arg: LongInt): LongInt; cdecl; external 'c
 function libc_usleep(usec: LongWord): LongInt; cdecl; external 'c' name 'usleep';
 function libc_sigaltstack(ss, oss: Pointer): LongInt; cdecl; external 'c' name 'sigaltstack';
 function libc_madvise(addr: Pointer; len: PtrUInt; advice: LongInt): LongInt; cdecl; external 'c' name 'madvise';
+{ _exit, not exit: the fatal path must not run finalization or flush
+  anything through code that takes locks. }
+procedure libc_exit(code: LongInt); cdecl; external 'c' name '_exit';
+
+{ rtl/inc/system.inc, exported as a global symbol (verified with nm): this
+  is how the RTL turns a signal into a normal Pascal exception, and code
+  202 is EStackOverflow (rtl/objpas/sysutils/sysutils.inc). Calling it is
+  what makes the overflow CATCHABLE by the user's try/except. }
+procedure HandleErrorAddrFrame(Errno: LongInt; Addr, Frame: Pointer);
+  external name 'SYSTEM_$$_HANDLEERRORADDRFRAME$LONGINT$POINTER$POINTER';
 
 threadvar
   currentM: PM;
@@ -870,6 +923,45 @@ begin
   Result := True;
 end;
 
+{ ---- the yellow guard band -------------------------------------------------
+  The guard is two pages. The upper one, immediately below stackLo, is the
+  YELLOW page: the first thing an overflowing stack touches. Opening it gives
+  the pasrutina a page of headroom, which is what lets the RTL's error path
+  run and the user's except block execute. The lower page stays PROT_NONE for
+  ever, so an overflow that continues past the rescue still faults instead of
+  quietly writing over another stack.
+
+  Both are called from a signal handler: no heap, no locks, one syscall. }
+
+function YellowStart(gp: PG): Pointer; inline;
+begin
+  Result := Pointer(PtrUInt(gp^.stackLo) - pageSize);
+end;
+
+function OpenYellow(gp: PG): Boolean;
+begin
+  if guardWithMprotect then
+    Result := Fpmprotect(YellowStart(gp), pageSize, PROT_READ or PROT_WRITE) = 0
+  else
+    Result := libc_madvise(YellowStart(gp), pageSize, MADV_GUARD_REMOVE) = 0;
+  if Result then
+    gp^.yellowOpen := True;
+end;
+
+{ Re-arm on recycle. Without this the next pasrutina to inherit the stack
+  would start with no net at all, and its overflow would be the old silent
+  fault loop again. }
+procedure ArmYellow(gp: PG);
+begin
+  if not gp^.yellowOpen then
+    Exit;
+  if guardWithMprotect then
+    Fpmprotect(YellowStart(gp), pageSize, PROT_NONE)
+  else
+    libc_madvise(YellowStart(gp), pageSize, MADV_GUARD_INSTALL);
+  gp^.yellowOpen := False;
+end;
+
 function AllocG(StackSize: PtrUInt): PG;
 begin
   New(Result);
@@ -912,6 +1004,7 @@ var
   h: PG;
 begin
   gp^.status := Gdead;
+  ArmYellow(gp);          { the next owner of this stack gets its net back }
   gp^.fn := nil;
   gp^.arg := nil;
   gp^.method.Code := nil;
@@ -2821,9 +2914,124 @@ begin
   libc_sigaltstack(@ss, nil);
 end;
 
+{ The RTL's SIGSEGV action, kept so that everything which is NOT a stack
+  overflow goes on behaving exactly as it does today. }
+var
+  rtlSegvAct: SigActionRec;
+  rtlSegvSaved: Boolean = False;
+
+{ Async-signal-safe by construction: a fixed buffer, one write, one _exit.
+  No heap, no Format, no PasWriteLn (which takes a critical section). }
+procedure FatalStackOverflow(gp: PG);
+var
+  buf: array[0..255] of Char;
+  n: LongInt;
+
+  procedure PutStr(const S: ShortString);
+  var k: LongInt;
+  begin
+    for k := 1 to Length(S) do
+      if n <= High(buf) then
+      begin
+        buf[n] := S[k];
+        Inc(n);
+      end;
+  end;
+
+  procedure PutNum(V: QWord);
+  var
+    d: array[0..23] of Char;
+    k: LongInt;
+  begin
+    if V = 0 then
+    begin
+      PutStr('0');
+      Exit;
+    end;
+    k := 0;
+    while (V > 0) and (k <= High(d)) do
+    begin
+      d[k] := Char(Ord('0') + (V mod 10));
+      V := V div 10;
+      Inc(k);
+    end;
+    while k > 0 do
+    begin
+      Dec(k);
+      if n <= High(buf) then
+      begin
+        buf[n] := d[k];
+        Inc(n);
+      end;
+    end;
+  end;
+
+begin
+  n := 0;
+  PutStr('pasrutinas: fatal: stack overflow in pasrutina ');
+  if gp <> nil then PutNum(gp^.goid) else PutStr('?');
+  PutStr(' (stack ');
+  if gp <> nil then PutNum(gp^.stackSize) else PutStr('?');
+  PutStr(' bytes). The rescue page was already open, so the overflow ran past'#10);
+  PutStr('it. Raise the stack with PasSetStackSize().'#10);
+  libc_write(2, @buf[0], n);
+  libc_exit(2);
+end;
+
+{ SIGSEGV. Anything that is not this pasrutina's own guard band is handed
+  straight to the RTL, so a null dereference still raises a catchable
+  EAccessViolation exactly as before.
+
+  A fault INSIDE the band is a stack overflow, and until 2026-09-20 it was
+  not survivable: the RTL rewrites the signal context to resume its error
+  trampoline on the very stack that just ran out, the trampoline's own push
+  faults eight bytes lower, and that repeats for ever. Measured: one core
+  pinned at 100%, that M lost to the scheduler, every waiter hung, and not
+  one byte printed.
+
+  So the FIRST fault is intercepted here: open the yellow page to buy a page
+  of headroom, then do what the RTL would have done but with error 202
+  instead of 216. The pasrutina resumes with room to run, raises
+  EStackOverflow, and the user's except block gets to clean up. }
+procedure PasSigSegv(sig: LongInt; info: PSigInfo; ctx: PPasSigCtx); cdecl;
+var
+  mp: PM;
+  gp: PG;
+  fault, lo: PtrUInt;
+begin
+  mp := currentM;
+  if mp <> nil then
+    gp := mp^.curg
+  else
+    gp := nil;
+
+  if (gp <> nil) and (ctx <> nil) and (gp^.stackMap <> nil) and (not gp^.isG0) then
+  begin
+    fault := PtrUInt(ctx^.cr2);
+    lo := PtrUInt(gp^.stackLo);
+    if (fault >= PtrUInt(gp^.stackMap)) and (fault < lo) then
+    begin
+      { yellow page, first hit: rescue it }
+      if (not gp^.yellowOpen) and (fault >= lo - pageSize) and OpenYellow(gp) then
+      begin
+        ctx^.rdi := 202;                        { 202 = EStackOverflow }
+        ctx^.rsi := ctx^.rip;
+        ctx^.rdx := ctx^.rbp;
+        ctx^.rip := PtrUInt(@HandleErrorAddrFrame);
+        Exit;
+      end;
+      { red page, or yellow already open: the rescue itself overflowed }
+      FatalStackOverflow(gp);
+    end;
+  end;
+
+  if rtlSegvSaved and (rtlSegvAct.sa_handler <> nil) then
+    TPasSigHandler3(rtlSegvAct.sa_handler)(sig, info, ctx);
+end;
+
 procedure InstallOnStackHandlers;
 const
-  sigs: array[0..3] of LongInt = (SIGSEGV, SIGBUS, SIGFPE, SIGILL);
+  sigs: array[0..2] of LongInt = (SIGBUS, SIGFPE, SIGILL);
 var
   i: LongInt;
   act: SigActionRec;
@@ -2838,6 +3046,21 @@ begin
     act.sa_flags := act.sa_flags or SA_ONSTACK;
     FpSigAction(sigs[i], @act, nil);
   end;
+
+  { SIGSEGV is ours, chained to the RTL's. The struct is READ and copied,
+    never built from Default(): on Linux x86_64 rt_sigaction needs the
+    sa_restorer the kernel reported, and zeroing it kills the process with a
+    core on RETURN from the handler -- even for a plain null dereference.
+    Measured 2026-09-20, and it cost two aborted diagnostics to find. }
+  if rtlSegvSaved then
+    Exit;
+  if FpSigAction(SIGSEGV, nil, @rtlSegvAct) <> 0 then
+    Exit;
+  rtlSegvSaved := True;
+  act := rtlSegvAct;
+  act.sa_handler := TSigActionHandler(@PasSigSegv);
+  act.sa_flags := act.sa_flags or SA_SIGINFO or SA_ONSTACK;
+  FpSigAction(SIGSEGV, @act, nil);
 end;
 
 { Runs from ExitProc, i.e. before unit finalization and heap teardown
@@ -3235,6 +3458,27 @@ end;
 function PasStackSize: PtrUInt;
 begin
   Result := defaultStack;
+end;
+
+{ Bytes still below the caller before the guard band. Code that is about to
+  recurse deeply, or to put a large buffer on the stack, can look instead of
+  finding out the hard way -- the hard way now survives, but it costs the
+  pasrutina. Approximate by a word or two: the address of a local is close
+  enough to rsp for deciding whether there is room. }
+function PasStackAvail: PtrUInt;
+var
+  mp: PM;
+  gp: PG;
+  sp: PtrUInt;
+begin
+  Result := 0;
+  mp := GetM;
+  if (mp = nil) or (mp^.curg = nil) then
+    Exit;
+  gp := mp^.curg;
+  sp := PtrUInt(@sp);
+  if sp > PtrUInt(gp^.stackLo) then
+    Result := sp - PtrUInt(gp^.stackLo);
 end;
 
 { Output is a threadvar Text (rtl/inc/systemh.inc): each OS thread has
