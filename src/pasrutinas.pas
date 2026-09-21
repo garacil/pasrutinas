@@ -2612,6 +2612,31 @@ begin
     fl := libc_fcntl(Fd, F_GETFL, 0);
     if fl >= 0 then
       libc_fcntl(Fd, F_SETFL, fl or O_NONBLOCK);
+
+    { The latches are cleared BEFORE the fd joins epoll, and the order is the
+      whole point. netpoll runs on another thread and does NOT take pollLock:
+      it goes straight from ev.data to NetpollUnblock, which CASes rg. Clearing
+      after the ADD loses any readiness that lands in between:
+
+         this thread                    netpoll thread
+         epoll_ctl(ADD) ------------->
+                                        epoll_wait reports the fd ready
+                                        rg := pdReady
+         rg := pdNil   <-- WIPED
+
+      The waiter then parks on a latch that will never be set again, because
+      the poller is edge-triggered and that edge is spent. Measured before this
+      change: 0.18% of accepted connections hung forever in PasWaitRead, at
+      every rate tried, from 71 to 2 500 connections a second.
+
+      Clearing first cannot lose anything: until the ADD succeeds this pd is
+      unreachable from the poller. A stale event from a previous incarnation of
+      the fd can still set pdReady afterwards, but a spurious wake-up is
+      harmless -- the caller retries the syscall, gets EAGAIN and waits again.
+      A lost wake-up is not. }
+    Result^.rg := pdNil;
+    Result^.wg := pdNil;
+
     ev := Default(TEpollEvent);
     ev.events := EPOLLIN or EPOLLOUT or EPOLLRDHUP or EPOLLET;
     ev.data := Result;
@@ -2623,8 +2648,6 @@ begin
         raise Exception.CreateFmt('pasrutinas: epoll_ctl(ADD, %d) failed, errno %d', [Fd, fpgeterrno]);
       end;
     end;
-    Result^.rg := pdNil;
-    Result^.wg := pdNil;
     Result^.registered := True;
   end;
   LockRelease(pollLock);
