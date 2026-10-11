@@ -1,5 +1,6 @@
 bin/
 units/
+build/
 *.o
 *.ppu
 *.a
