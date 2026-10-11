@@ -293,3 +293,58 @@ Tested on Fedora 38, FPC 3.2.2, kernel 6.8.9:
 **Not** verified: the `MADV_GUARD_REMOVE` path. This kernel is 6.8.9, so it
 falls back to `mprotect` and only that branch was exercised. The 6.13+ branch
 is symmetric by inspection and untested by measurement.
+
+## 8. WaitGroup: Wait returned before Done had let go
+
+Added 2026-10-11. Found from the outside, in a server that tears a connection
+down with the most ordinary shape there is:
+
+```pascal
+C^.WriterEnd.Wait;   { the connection's second pasrutina is gone... }
+C^.WriterEnd.Free;   { ...so what the two shared can be freed }
+```
+
+### What it did
+
+`Add(-1)` decremented the counter with a bare atomic add, and only then took
+`FLock` to collect the waiters. `Wait` returned straight away on a lock-free
+`FCount = 0`. On two Ms that is a use-after-free:
+
+```
+Done (M1)                          Wait + Free (M2)
+FCount: 1 -> 0
+                                   FCount = 0: return
+                                   Free
+LockAcquire(FLock)   <-- freed memory
+```
+
+Go never sees this: its WaitGroup state and semaphore outlive any reference
+because the garbage collector keeps them. Here nothing does. Measured with a
+driver that releases a `Done` and a `Wait`-then-`Free` at the same instant
+from different Ms: **1 040 failures in 477 605 pairs**, a mix of
+`EAccessViolation` and `pasrutinas: unlock of unlocked lock`. In the server
+the window is a few hundred nanoseconds per connection closed, so it had not
+fired in production — but when it fires, `Done` writes into memory that is
+already someone else's.
+
+### What it does now
+
+Every decrement takes `FLock`, and `Wait` reads `FCount` under `FLock` too —
+no lock-free fast path. A `Wait` that sees zero therefore acquired the lock
+after the `Done` released it, and a `Done` touches nothing of the WaitGroup
+after that release: the waiters it wakes are Gs, already moved to a local
+list. Increments stay lock-free, as in Go; they can never make `Wait` return.
+
+The one access left after the release is the futex wake inside
+`LockRelease`, when a waiter was asleep on the lock word. That is a syscall on
+an address, not a memory access, and futex users tolerate a spurious wake by
+construction — the same property glibc's mutexes rely on to allow destroying
+a mutex right after unlocking it.
+
+### Verified
+
+- `tests/test_waitgroup.pas`: the driver above for 3 seconds, fields poisoned
+  before `Free` so a late `Done` cannot go unnoticed. Against the previous
+  code it fails every run (495, 670 and 1 238 failures in three runs of
+  ~63 000 pairs); against the fix it passes every run.
+- `make check` green: 17 tests and 8 examples.

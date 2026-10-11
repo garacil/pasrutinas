@@ -3648,7 +3648,31 @@ begin
   end;
 end;
 
-{ TPasWaitGroup: sync.WaitGroup semantics on a counter + parked waiters. }
+{ TPasWaitGroup: sync.WaitGroup semantics on a counter + parked waiters.
+
+  WAIT RETURNING MEANS DONE HAS LET GO OF THE OBJECT. The usual shape is
+  "Wait, then Free": the owner frees the WaitGroup as soon as Wait returns.
+  Go gets that for free from its garbage collector; here it has to hold by
+  construction, and it did not.
+
+  Add used to decrement with a bare atomic add and only then take FLock to
+  collect the waiters, while Wait returned at once on a lock-free
+  FCount = 0. So, on two Ms:
+
+      Done (M1)                         Wait + Free (M2)
+      FCount: 1 -> 0
+                                        FCount = 0: return
+                                        Free
+      LockAcquire(FLock)  <-- freed memory
+
+  Measured: 1 040 failures in 477 605 Wait-then-Free pairs, a mix of
+  EAccessViolation and "unlock of unlocked lock".
+
+  Now every decrement happens under FLock, and Wait reads FCount under FLock
+  as well. A Wait that sees zero has therefore acquired the lock after the
+  Done released it, and a Done touches nothing of the WaitGroup after that
+  release: the waiters it wakes are Gs, already moved to a local list.
+  Increments stay lock-free, as in Go; they can never make Wait return. }
 
 constructor TPasWaitGroup.Create;
 begin
@@ -3669,15 +3693,27 @@ var
   w, nx: PG;
 begin
   PasInit;
+  if Delta >= 0 then
+  begin
+    InterlockedExchangeAdd(FCount, Delta);
+    Exit;
+  end;
+  LockAcquire(FLock);
   n := InterlockedExchangeAdd(FCount, Delta) + Delta;
   if n < 0 then
+  begin
+    InterlockedExchangeAdd(FCount, -Delta);
+    LockRelease(FLock);
     raise Exception.Create('TPasWaitGroup.Add: negative counter');
-  if (n > 0) or (Delta >= 0) then
-    Exit;
-  LockAcquire(FLock);
-  w := PG(FWaiters);
-  FWaiters := nil;
+  end;
+  w := nil;
+  if n = 0 then
+  begin
+    w := PG(FWaiters);
+    FWaiters := nil;
+  end;
   LockRelease(FLock);
+  { From here on the WaitGroup may already be freed: only Gs are touched. }
   while w <> nil do
   begin
     nx := w^.waitlink;
@@ -3697,15 +3733,15 @@ var
   gp: PG;
 begin
   PasInit;
-  if FCount = 0 then
-    Exit;
-  gp := PG(PasCurrent);
+  { No lock-free "FCount = 0, return" fast path: that read is what let Wait
+    return while the Done that zeroed the counter still held the object. }
   LockAcquire(FLock);
   if FCount = 0 then
   begin
     LockRelease(FLock);
     Exit;
   end;
+  gp := PG(PasCurrent);
   gp^.waitlink := PG(FWaiters);
   FWaiters := gp;
   PasInternalParkUnlockLock(FLock);

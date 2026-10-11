@@ -14,7 +14,8 @@ SRCS     := src/pasrutinas.pas src/paschan.pas
 EXAMPLES := hola pingpong miles sleep select poll mutex once
 TESTS    := test_spawn test_chan test_bufchan test_select test_sleep test_mutex \
             test_once test_mn test_exceptions test_sigstack test_timers \
-            test_netpoll test_selclose test_writeln test_stress test_syscall
+            test_netpoll test_selclose test_writeln test_stress test_syscall \
+            test_waitgroup
 
 .PHONY: all examples tests check bench clean install uninstall \
         install-units uninstall-units

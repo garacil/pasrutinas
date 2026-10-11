@@ -231,6 +231,7 @@ and hints are errors):
 | test_writeln | 16 000 lines from 32 pasrutinas through a pipe, none corrupted |
 | test_stress | 300 000 spawns, 1 000 000 yields, 20 000 parked at once |
 | test_syscall | blocking syscalls hand their P to another OS thread |
+| test_waitgroup | `Wait` then `Free` while `Done` runs on another OS thread: `Wait` returns only once `Done` has let go |
 
 ## Layout
 
